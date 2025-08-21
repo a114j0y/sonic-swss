@@ -189,9 +189,9 @@ size_t Orch::retryToSync(const std::string &executorName, size_t threshold)
 
     size_t count = 0;
 
-    for (auto it = constraints.begin(); it != constraints.end() && count < threshold;)
+    while (!constraints.empty() && count < threshold)
     {
-        auto cst = *it++;
+        auto cst = *constraints.begin();
 
         auto tasks = retryCache->resolve(cst, threshold - count);
 
@@ -205,7 +205,15 @@ size_t Orch::retryToSync(const std::string &executorName, size_t threshold)
 
 void Orch::notifyRetry(Orch *retryOrch, const std::string &executorName, const Constraint &cst)
 {
-    retryOrch->getRetryCache(executorName)->add_resolution(cst);
+    auto retryCache = retryOrch->getRetryCache(executorName);
+    if (!retryCache)
+    {
+        SWSS_LOG_ERROR("RetryCache not initialized for %s", executorName.c_str());
+    }
+    else
+    {
+        retryCache->add_resolution(cst);
+    }
 }
 
 size_t ConsumerBase::addToSync(std::shared_ptr<std::deque<swss::KeyOpFieldsValuesTuple>> entries, bool onRetry) {
@@ -229,18 +237,50 @@ void ConsumerBase::addToSync(const KeyOpFieldsValuesTuple &entry, bool onRetry)
 
     if (retryCache)
     {
-        auto it = retryCache->getRetryMap().find(key);
-        if (it != retryCache->getRetryMap().end()) // key exists
+        auto count = retryCache->getRetryMap().count(key);
+        
+        switch (count)
         {
+        case 0:
+            // No task with the same key found in the retrycache
+            break;
+
+        case 1:
+        {
+            // Single task found
+            auto it = retryCache->getRetryMap().find(key);
             if (it->second.second == entry) // skip duplicate task
                 return;
-            
+
             auto cache = retryCache->erase_stale_cache(key);
-
             Recorder::Instance().retry.record(dumpTuple(*cache).append(DECACHE));
-
             if (op == SET_COMMAND)
                 m_toSync.emplace(key, std::move(*cache));
+            break;
+        }
+        case 2:
+        {
+            // 2 tasks found, the first must be DEL, the second must be SET
+            if (op == DEL_COMMAND)
+            {
+                retryCache->erase_stale_cache(key);
+            }
+            else if (op == SET_COMMAND)
+            {
+                // Add the first DEL task back into m_toSync
+                auto cache = retryCache->erase_stale_cache(key);
+                Recorder::Instance().retry.record(dumpTuple(*cache).append(DECACHE));
+                m_toSync.emplace(key, std::move(*cache));
+
+                // Add the second SET task back into m_toSync
+                cache = retryCache->erase_stale_cache(key);
+                Recorder::Instance().retry.record(dumpTuple(*cache).append(DECACHE));
+                m_toSync.emplace(key, std::move(*cache));
+            }
+            break;
+        }
+        default:
+            SWSS_LOG_ERROR("Maximum two values per key, found: %zu", count);
         }
     }
 
